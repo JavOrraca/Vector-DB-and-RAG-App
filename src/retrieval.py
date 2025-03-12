@@ -2,51 +2,75 @@ from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.chains import RetrievalQA
 from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
+import os
 
-class RPackageRagSystem:
+class RagSystem:
     """
-    RAG system for querying R package documentation and code.
+    RAG system for querying documentation and code from various file types.
     """
     
-    def __init__(self, docs_db_path, code_db_path, anthropic_api_key=None):
+    def __init__(self, db_path, llm_provider="anthropic", model_name="claude-3-7-sonnet-20250219", 
+                api_key=None, system_prompt=None):
         """
-        Initialize the RAG system with paths to the vector databases.
+        Initialize the RAG system with a path to the vector database.
         
         Args:
-            docs_db_path: Path to the Chroma DB for markdown documentation
-            code_db_path: Path to the Chroma DB for R code
-            anthropic_api_key: Optional Anthropic API key
+            db_path: Path to the Chroma DB for embeddings
+            llm_provider: LLM provider to use ('anthropic' or 'openai')
+            model_name: Name of the model to use
+            api_key: Optional API key (otherwise uses environment variables)
+            system_prompt: Optional system prompt for the LLM
         """
         # Load embedding model
         self.embedding_model = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
         
-        # Load vector databases
-        self.docs_db = Chroma(
-            persist_directory=docs_db_path,
+        # Load vector database
+        self.db = Chroma(
+            persist_directory=db_path,
             embedding_function=self.embedding_model
         )
         
-        self.code_db = Chroma(
-            persist_directory=code_db_path,
-            embedding_function=self.embedding_model
-        )
+        # Default system prompt if none provided
+        if system_prompt is None:
+            system_prompt = "You are an AI assistant."
         
-        # Initialize LLM (Claude 3.7 Sonnet)
-        self.llm = ChatAnthropic(
-            temperature=0,
-            model="claude-3-7-sonnet-20250219",
-            anthropic_api_key=anthropic_api_key
-        )
+        # Initialize LLM based on provider
+        if llm_provider.lower() == "anthropic":
+            # Get API key from args or environment
+            anthropic_api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+            if not anthropic_api_key:
+                raise ValueError("No Anthropic API key provided. Set it with api_key parameter or ANTHROPIC_API_KEY environment variable.")
+            
+            self.llm = ChatAnthropic(
+                temperature=0,
+                model=model_name,
+                anthropic_api_key=anthropic_api_key,
+                system=system_prompt
+            )
+        elif llm_provider.lower() == "openai":
+            # Get API key from args or environment
+            openai_api_key = api_key or os.environ.get("OPENAI_API_KEY")
+            if not openai_api_key:
+                raise ValueError("No OpenAI API key provided. Set it with api_key parameter or OPENAI_API_KEY environment variable.")
+            
+            self.llm = ChatOpenAI(
+                temperature=0,
+                model=model_name,
+                openai_api_key=openai_api_key,
+                model_kwargs={"messages": [{"role": "system", "content": system_prompt}]}
+            )
+        else:
+            raise ValueError(f"Unsupported LLM provider: {llm_provider}. Use 'anthropic' or 'openai'.")
         
         # Create prompt template
         self.prompt_template = PromptTemplate(
             input_variables=["context", "question"],
             template="""
-            You are an expert R programmer and data scientist. Use the provided context about R packages 
-            to answer the user's question. The context includes both documentation and code from various R packages.
+            Use the provided context to answer the user's question.
             
             Context:
             {context}
@@ -58,41 +82,22 @@ class RPackageRagSystem:
             """
         )
     
-    def query(self, question, k=5, doc_weight=0.7):
+    def query(self, question, k=5):
         """
         Query the RAG system with a question.
         
         Args:
-            question: User's question about R packages
-            k: Number of documents to retrieve from each database
-            doc_weight: Weight to give documentation vs code (0-1)
+            question: User's question
+            k: Number of documents to retrieve from the database
             
         Returns:
             Answer from the LLM
         """
-        # Retrieve relevant documentation
-        docs_results = self.docs_db.similarity_search_with_score(question, k=k)
-        
-        # Retrieve relevant code
-        code_results = self.code_db.similarity_search_with_score(question, k=k)
-        
-        # Combine results with weighting
-        combined_results = []
-        
-        # Add documentation with its weight
-        for doc, score in docs_results:
-            combined_results.append((doc, score * doc_weight))
-        
-        # Add code with its weight
-        for doc, score in code_results:
-            combined_results.append((doc, score * (1 - doc_weight)))
-        
-        # Sort by weighted score and take top k*2
-        combined_results.sort(key=lambda x: x[1], reverse=True)
-        top_results = combined_results[:k*2]
+        # Retrieve relevant documents
+        results = self.db.similarity_search_with_score(question, k=k)
         
         # Extract documents
-        context_docs = [item[0] for item in top_results]
+        context_docs = [doc for doc, _ in results]
         
         # Build context string
         context_str = "\n\n".join([
@@ -104,7 +109,7 @@ class RPackageRagSystem:
         chain = RetrievalQA.from_chain_type(
             llm=self.llm,
             chain_type="stuff",
-            retriever=self.docs_db.as_retriever(search_kwargs={"k": k}),
+            retriever=self.db.as_retriever(search_kwargs={"k": k}),
             chain_type_kwargs={"prompt": self.prompt_template}
         )
         
@@ -120,7 +125,7 @@ class RPackageRagSystem:
         """
         Start an interactive session for querying the RAG system.
         """
-        print("R Package RAG System - Interactive Mode (powered by Claude 3.7 Sonnet)")
+        print("RAG System - Interactive Mode")
         print("Type 'exit' to quit")
         
         while True:
@@ -136,13 +141,38 @@ class RPackageRagSystem:
             except Exception as e:
                 print(f"Error: {e}")
 
+# For backward compatibility
+class RPackageRagSystem(RagSystem):
+    """
+    Legacy class for backward compatibility. Use RagSystem instead.
+    """
+    
+    def __init__(self, docs_db_path, code_db_path, anthropic_api_key=None):
+        """
+        Initialize the RAG system with paths to the vector databases.
+        
+        Args:
+            docs_db_path: Path to the Chroma DB for markdown documentation
+            code_db_path: Path to the Chroma DB for R code
+            anthropic_api_key: Optional Anthropic API key
+        """
+        print("Warning: RPackageRagSystem is deprecated. Use RagSystem instead.")
+        
+        # Use the main db path (they should be the same in new version, but respect legacy behavior)
+        super().__init__(
+            db_path=docs_db_path,
+            llm_provider="anthropic", 
+            model_name="claude-3-7-sonnet-20250219",
+            api_key=anthropic_api_key,
+            system_prompt="You are an expert R programmer and data scientist. Use the provided context about R packages to answer the user's question."
+        )
+
 if __name__ == "__main__":
     # Example usage
-    docs_db_path = "./chroma_db_r_packages_docs"
-    code_db_path = "./chroma_db_r_packages_code"
+    db_path = "./chroma_db/knowledge_base"
     
     # Initialize RAG system
-    rag = RPackageRagSystem(docs_db_path, code_db_path)
+    rag = RagSystem(db_path)
     
     # Start interactive mode
     rag.interactive_mode()
